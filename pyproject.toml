@@ -52,6 +52,11 @@ dependencies = [
     "scipy>=1.15.3",
     "uharfbuzz>=0.50.2",
     "scikit-learn>=1.7.1",
+    # FastAPI 相关依赖
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "python-multipart>=0.0.6",
+    "python-jose[cryptography]>=3.3.0",
 ]
 
 [project.optional-dependencies]
@@ -65,6 +70,7 @@ Issues = "https://github.com/funstory-ai/BabelDOC/issues"
 
 [project.scripts]
 babeldoc = "babeldoc.main:cli"
+babeldoc-api = "babeldoc.api.main:main"
 
 [build-system]
 requires = ["hatchling"]
