@@ -34,6 +34,7 @@
 PDF scientific paper translation and bilingual comparison library.
 
 - **Online Service**: Beta version launched [Immersive Translate - BabelDOC](https://app.immersivetranslate.com/babel-doc/) 1000 free pages per month.
+- **FastAPI Service**: NEW! Deploy BabelDOC as a web service with REST API. See [API Documentation](docs/API_README.md).
 - **Self-deployment**: [PDFMathTranslate 2.0](https://github.com/PDFMathTranslate/PDFMathTranslate-next) support for BabelDOC, available for self-deployment + WebUI with more translation services.
 - Provides a simple [command line interface](#getting-started).
 - Provides a [Python API](#python-api).
@@ -46,6 +47,33 @@ PDF scientific paper translation and bilingual comparison library.
 > 1. Immersive Translate Pro members can use the [immersive-translate/zotero-immersivetranslate](https://github.com/immersive-translate/zotero-immersivetranslate) plugin
 >
 > 2. PDFMathTranslate self-deployed users can use the [guaguastandup/zotero-pdf2zh](https://github.com/guaguastandup/zotero-pdf2zh) plugin
+
+## 🚀 Quick Start - API Service
+
+Deploy BabelDOC as a web service with REST API:
+
+```bash
+# Install with API dependencies
+pip install -e .
+
+# Start the API server
+python -m babeldoc.api.server
+
+# Or use the command line tool
+babeldoc-api
+```
+
+Access the API documentation at: http://localhost:8000/docs
+
+**Key Features:**
+- ✅ RESTful API with file upload and async translation
+- ✅ Intelligent file caching system  
+- ✅ Real-time progress tracking via WebSocket
+- ✅ Multi-task concurrent processing
+- ✅ Docker deployment support
+- ✅ Auto cleanup of expired tasks and cache
+
+For detailed API usage, see [API Documentation](docs/API_README.md).
 
 [Supported Language](https://funstory-ai.github.io/BabelDOC/supported_languages/)
 
