@@ -28,6 +28,12 @@ COPY README.md LICENSE ./
 # 安装 uv
 RUN pip install uv
 
+# 创建uv配置目录
+RUN mkdir -p ~/.config/uv
+
+# 配置uv使用清华镜像源
+RUN echo '{"index-url": "https://pypi.tuna.tsinghua.edu.cn/simple", "trusted-hosts": ["pypi.tuna.tsinghua.edu.cn"]}' > ~/.config/uv/config.toml
+
 # 安装依赖
 RUN uv sync --no-dev
 
