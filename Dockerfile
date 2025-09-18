@@ -32,7 +32,11 @@ RUN pip install uv
 RUN mkdir -p ~/.config/uv
 
 # 配置uv使用清华镜像源
-RUN echo '{"index-url": "https://pypi.tuna.tsinghua.edu.cn/simple", "trusted-hosts": ["pypi.tuna.tsinghua.edu.cn"]}' > ~/.config/uv/config.toml
+RUN mkdir -p ~/.config/uv
+RUN cat > ~/.config/uv/config.toml <<EOF
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+trusted-hosts = ["pypi.tuna.tsinghua.edu.cn"]
+EOF
 
 # 安装依赖
 RUN uv sync --no-dev
