@@ -57,6 +57,13 @@ ENV BABELDOC_CACHE_DIR=/app/cache
 ENV BABELDOC_LOG_FILE=/app/logs/api.log
 ENV BABELDOC_MAX_CONCURRENT_TASKS=3
 
+# 添加环境变量以改善Linux下的内存管理和ONNX Runtime行为
+ENV OMP_NUM_THREADS=1
+ENV ONNXRUNTIME_LOG_SEVERITY_LEVEL=3
+ENV MALLOC_MMAP_THRESHOLD_=131072
+ENV MALLOC_TRIM_THRESHOLD_=131072
+ENV PYTHONMALLOC=malloc
+
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
   CMD curl -f http://localhost:8000/health || exit 1

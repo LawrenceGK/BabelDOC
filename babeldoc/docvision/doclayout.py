@@ -12,6 +12,9 @@ from babeldoc.docvision.base_doclayout import DocLayoutModel
 from babeldoc.docvision.base_doclayout import YoloResult
 from babeldoc.format.pdf.document_il.utils.mupdf_helper import get_no_rotation_img
 
+# 全局锁保护模型初始化，避免多线程初始化冲突
+_model_init_lock = threading.RLock()
+
 try:
     import onnx
     import onnxruntime
@@ -38,26 +41,37 @@ os_name = platform.system()
 
 class OnnxModel(DocLayoutModel):
     def __init__(self, model_path: str):
-        self.model_path = model_path
+        # 使用全局锁保护整个模型初始化过程
+        with _model_init_lock:
+            self.model_path = model_path
 
-        model = onnx.load(model_path)
-        metadata = {d.key: d.value for d in model.metadata_props}
-        self._stride = ast.literal_eval(metadata["stride"])
-        self._names = ast.literal_eval(metadata["names"])
-        providers = []
+            model = onnx.load(model_path)
+            metadata = {d.key: d.value for d in model.metadata_props}
+            self._stride = ast.literal_eval(metadata["stride"])
+            self._names = ast.literal_eval(metadata["names"])
+            providers = []
 
-        available_providers = onnxruntime.get_available_providers()
-        for provider in available_providers:
-            # disable dml|cuda|
-            # directml/cuda may encounter problems under special circumstances
-            if re.match(r"cpu", provider, re.IGNORECASE):
-                logger.info(f"Available Provider: {provider}")
-                providers.append(provider)
-        self.model = onnxruntime.InferenceSession(
-            model.SerializeToString(),
-            providers=providers,
-        )
-        self.lock = threading.Lock()
+            available_providers = onnxruntime.get_available_providers()
+            for provider in available_providers:
+                # disable dml|cuda|
+                # directml/cuda may encounter problems under special circumstances
+                if re.match(r"cpu", provider, re.IGNORECASE):
+                    logger.info(f"Available Provider: {provider}")
+                    providers.append(provider)
+            
+            # 配置ONNX Runtime session选项以改善内存管理
+            session_options = onnxruntime.SessionOptions()
+            session_options.enable_cpu_mem_arena = False  # 禁用内存池，避免Linux下的内存冲突
+            session_options.enable_mem_pattern = False   # 禁用内存模式优化
+            session_options.enable_mem_reuse = False     # 禁用内存重用
+            session_options.log_severity_level = 3       # 降低日志级别
+            
+            self.model = onnxruntime.InferenceSession(
+                model.SerializeToString(),
+                providers=providers,
+                sess_options=session_options,
+            )
+            self.lock = threading.Lock()
 
     @staticmethod
     def from_pretrained():
