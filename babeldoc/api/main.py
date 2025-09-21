@@ -23,10 +23,13 @@ from contextlib import asynccontextmanager
 from babeldoc.api.models import (
     TranslationRequest, TranslationResponse, TaskInfo, TaskStatus,
     TaskListResponse, FileUploadResponse, CacheStats, HealthResponse,
-    ErrorResponse, ConfigResponse, ProgressUpdate, WatermarkMode
+    ErrorResponse, ConfigResponse, ProgressUpdate, WatermarkMode,
+    OutputFileType, BatchDownloadRequest, BatchDownloadResponse, 
+    BatchDownloadFileInfo, OutputFileInfo
 )
 from babeldoc.api.task_manager import get_task_manager, TaskManager
 from babeldoc.api.cache import get_cache, FileCache
+from babeldoc.api.utils import BatchDownloadManager, generate_archive_filename, format_file_size
 
 # 配置日志
 logging.basicConfig(level=logging.INFO)
@@ -83,18 +86,34 @@ SUPPORTED_LANGUAGES = {
 task_manager: TaskManager
 file_cache: FileCache
 result_cache: FileCache
+batch_manager: BatchDownloadManager
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global task_manager, file_cache, result_cache
+    global task_manager, file_cache, result_cache, batch_manager
     
     # 启动时初始化
     logger.info("初始化 BabelDOC API 服务")
     task_manager = get_task_manager()
     file_cache = get_cache('uploaded_files', max_age_days=1)  # 上传文件保存1天
     result_cache = get_cache('translation_results', max_age_days=7)  # 翻译结果保存7天
+    batch_manager = BatchDownloadManager()  # 初始化批量下载管理器
+    
+    # 启动后台清理任务
+    async def cleanup_task():
+        """定期清理过期的批量下载文件"""
+        while True:
+            try:
+                await asyncio.sleep(3600)  # 每小时清理一次
+                cleaned = batch_manager.cleanup_expired_batches()
+                if cleaned > 0:
+                    logger.info(f"清理了 {cleaned} 个过期的批量下载文件")
+            except Exception as e:
+                logger.error(f"清理任务异常: {e}")
+    
+    cleanup_background_task = asyncio.create_task(cleanup_task())
     
     # 确保温身
     try:
@@ -108,6 +127,11 @@ async def lifespan(app: FastAPI):
     
     # 关闭时清理
     logger.info("关闭 BabelDOC API 服务")
+    cleanup_background_task.cancel()
+    try:
+        await cleanup_background_task
+    except asyncio.CancelledError:
+        pass
 
 
 # 创建 FastAPI 应用
@@ -225,6 +249,24 @@ async def get_config():
             "max_concurrent_tasks": 3,
             "supported_formats": ["pdf"],
             "max_pages": 1000
+        },
+        output_options={
+            "file_types": [
+                {"type": "mono", "description": "仅译文版本"},
+                {"type": "dual", "description": "双语版本"},
+                {"type": "mono_no_watermark", "description": "仅译文无水印版本"},
+                {"type": "dual_no_watermark", "description": "双语无水印版本"},
+                {"type": "glossary", "description": "词汇表文件"}
+            ],
+            "dual_layout_modes": [
+                {"mode": "side_by_side", "description": "并排显示（默认）"},
+                {"mode": "alternating_pages", "description": "交替页面模式"}
+            ],
+            "watermark_modes": [
+                {"mode": "watermarked", "description": "带水印（默认）"},
+                {"mode": "no_watermark", "description": "无水印"},
+                {"mode": "both", "description": "同时生成两个版本"}
+            ]
         }
     )
 
@@ -236,7 +278,7 @@ async def upload_file(
 ):
     """上传PDF文件"""
     # 验证文件类型
-    if not file.filename.lower().endswith('.pdf'):
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="只支持PDF文件")
     
     # 验证文件大小（100MB限制）
@@ -269,7 +311,7 @@ async def upload_file(
         
         return FileUploadResponse(
             file_id=file_id,
-            filename=file.filename,
+            filename=file.filename or "unknown.pdf",
             file_size=len(file_content),
             uploaded_at=datetime.now(),
             expires_at=datetime.now() + timedelta(days=1)
@@ -508,10 +550,24 @@ async def cancel_task(
 @app.get("/tasks/{task_id}/download")
 async def download_results(
     task_id: str,
-    file_index: int = Query(0, ge=0, description="文件索引"),
+    file_type: Optional[OutputFileType] = Query(None, description="文件类型 (mono/dual/mono_no_watermark/dual_no_watermark/glossary)"),
+    file_index: Optional[int] = Query(None, ge=0, description="文件索引（向后兼容，建议使用file_type）"),
     api_key: Optional[str] = Depends(validate_api_key)
 ):
-    """下载翻译结果"""
+    """下载翻译结果
+    
+    支持两种下载方式：
+    1. 基于文件类型（推荐）：使用 file_type 参数指定要下载的文件类型
+       - mono: 仅译文版本
+       - dual: 双语版本  
+       - mono_no_watermark: 仅译文无水印版本
+       - dual_no_watermark: 双语无水印版本
+       - glossary: 词汇表文件
+    
+    2. 基于索引（向后兼容）：使用 file_index 参数指定文件索引
+    
+    优先使用 file_type，如果未指定则使用 file_index
+    """
     task = task_manager.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="任务不存在")
@@ -519,20 +575,283 @@ async def download_results(
     if task.status != TaskStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="任务尚未完成")
     
-    if file_index >= len(task.output_files):
+    target_file = None
+    filename_suffix = ""
+    
+    # 优先使用文件类型方式
+    if file_type is not None:
+        file_info = task.get_file_by_type(file_type)
+        if not file_info:
+            raise HTTPException(
+                status_code=404, 
+                detail=f"不存在类型为 '{file_type.value}' 的文件"
+            )
+        target_file = Path(file_info.file_path)
+        filename_suffix = f"_{file_type.value}"
+        
+    # 向后兼容：使用索引方式
+    elif file_index is not None:
+        if file_index >= len(task.output_files):
+            # 兜底：尝试使用老的字符串列表
+            if file_index >= len(task.output_file_paths):
+                raise HTTPException(status_code=404, detail="文件不存在")
+            target_file = Path(task.output_file_paths[file_index])
+        else:
+            file_info = task.output_files[file_index]
+            target_file = Path(file_info.file_path)
+        filename_suffix = f"_{file_index}"
+        
+    else:
+        # 默认下载第一个文件（通常是 mono 版本）
+        if not task.output_files and not task.output_file_paths:
+            raise HTTPException(status_code=404, detail="没有可下载的文件")
+        
+        if task.output_files:
+            target_file = Path(task.output_files[0].file_path)
+            filename_suffix = f"_{task.output_files[0].file_type.value}"
+        else:
+            target_file = Path(task.output_file_paths[0])
+            filename_suffix = "_0"
+    
+    if not target_file or not target_file.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
     
-    file_path = Path(task.output_files[file_index])
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="文件不存在")
-    
-    # 设置文件名
-    filename = f"{task.input_filename}_{task.lang_out}_{file_index}.pdf"
+    # 生成下载文件名
+    base_name = Path(task.input_filename).stem
+    file_extension = target_file.suffix
+    download_filename = f"{base_name}_{task.lang_out}{filename_suffix}{file_extension}"
     
     return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type='application/pdf'
+        path=target_file,
+        filename=download_filename,
+        media_type='application/pdf' if file_extension == '.pdf' else 'text/csv'
+    )
+
+
+@app.get("/tasks/{task_id}/download/mono")
+async def download_mono_version(
+    task_id: str,
+    watermark: bool = Query(True, description="是否下载带水印版本"),
+    api_key: Optional[str] = Depends(validate_api_key)
+):
+    """下载仅译文版本"""
+    file_type = OutputFileType.MONO if watermark else OutputFileType.MONO_NO_WATERMARK
+    return await download_results(task_id, file_type=file_type, api_key=api_key)
+
+
+@app.get("/tasks/{task_id}/download/dual")  
+async def download_dual_version(
+    task_id: str,
+    watermark: bool = Query(True, description="是否下载带水印版本"),
+    api_key: Optional[str] = Depends(validate_api_key)
+):
+    """下载双语版本"""
+    file_type = OutputFileType.DUAL if watermark else OutputFileType.DUAL_NO_WATERMARK
+    return await download_results(task_id, file_type=file_type, api_key=api_key)
+
+
+@app.get("/tasks/{task_id}/download/glossary")
+async def download_glossary(
+    task_id: str,
+    api_key: Optional[str] = Depends(validate_api_key)
+):
+    """下载词汇表"""
+    return await download_results(task_id, file_type=OutputFileType.GLOSSARY, api_key=api_key)
+
+
+@app.post("/tasks/batch/download", response_model=BatchDownloadResponse)
+async def batch_download(
+    request: BatchDownloadRequest,
+    api_key: Optional[str] = Depends(validate_api_key)
+):
+    """批量下载翻译结果
+    
+    支持以下功能：
+    - 按任务ID列表批量下载
+    - 按文件类型过滤（mono/dual/glossary等）
+    - 选择是否包含水印版本
+    - 自定义压缩包名称
+    
+    返回包含所有文件的ZIP压缩包下载链接
+    """
+    logger.info(f"开始批量下载，任务数: {len(request.task_ids)}")
+    
+    # 收集文件信息
+    files_to_zip = []
+    file_infos = []
+    total_size = 0
+    successful_files = 0
+    failed_files = 0
+    
+    # 用于生成压缩包名称的任务名列表
+    task_names = []
+    common_lang_out = None
+    
+    for task_id in request.task_ids:
+        task = task_manager.get_task(task_id)
+        if not task:
+            file_infos.append(BatchDownloadFileInfo(
+                task_id=task_id,
+                file_name=f"task_{task_id}",
+                file_type=OutputFileType.MONO,
+                file_size=0,
+                watermark=False,
+                status="failed",
+                error_message="任务不存在"
+            ))
+            failed_files += 1
+            continue
+            
+        if task.status != TaskStatus.COMPLETED:
+            file_infos.append(BatchDownloadFileInfo(
+                task_id=task_id,
+                file_name=task.input_filename or f"task_{task_id}",
+                file_type=OutputFileType.MONO,
+                file_size=0,
+                watermark=False,
+                status="failed",
+                error_message="任务尚未完成"
+            ))
+            failed_files += 1
+            continue
+        
+        # 收集任务信息用于生成文件名
+        task_names.append(task.input_filename or f"task_{task_id}")
+        if common_lang_out is None:
+            common_lang_out = task.lang_out
+        elif common_lang_out != task.lang_out:
+            common_lang_out = None  # 语言不一致时不使用语言后缀
+        
+        # 获取任务的输出文件
+        task_files = task.output_files if task.output_files else []
+        
+        # 如果没有新格式的文件信息，尝试从旧格式获取
+        if not task_files and task.output_file_paths:
+            for i, file_path in enumerate(task.output_file_paths):
+                if Path(file_path).exists():
+                    try:
+                        file_info = OutputFileInfo.from_file_path(file_path)
+                        task_files.append(file_info)
+                    except Exception as e:
+                        logger.error(f"解析文件信息失败 {file_path}: {e}")
+        
+        # 过滤文件
+        filtered_files = []
+        for file_info in task_files:
+            # 检查文件类型过滤
+            if request.file_types and file_info.file_type not in request.file_types:
+                continue
+                
+            # 检查水印过滤
+            if request.watermark is not None and file_info.watermark != request.watermark:
+                continue
+                
+            filtered_files.append(file_info)
+        
+        # 添加到下载列表
+        for file_info in filtered_files:
+            file_path = Path(file_info.file_path)
+            if not file_path.exists():
+                file_infos.append(BatchDownloadFileInfo(
+                    task_id=task_id,
+                    file_name=file_path.name,
+                    file_type=file_info.file_type,
+                    file_size=0,
+                    watermark=file_info.watermark,
+                    status="failed",
+                    error_message="文件不存在"
+                ))
+                failed_files += 1
+                continue
+            
+            # 生成在压缩包中的文件名
+            base_name = Path(task.input_filename).stem if task.input_filename else f"task_{task_id}"
+            lang_suffix = f"_{task.lang_out}" if task.lang_out else ""
+            type_suffix = f"_{file_info.file_type.value}"
+            watermark_suffix = "" if file_info.watermark else "_no_watermark"
+            file_extension = file_path.suffix
+            
+            archive_filename = f"{base_name}{lang_suffix}{type_suffix}{watermark_suffix}{file_extension}"
+            
+            files_to_zip.append({
+                'source_path': str(file_path),
+                'archive_name': archive_filename
+            })
+            
+            file_infos.append(BatchDownloadFileInfo(
+                task_id=task_id,
+                file_name=archive_filename,
+                file_type=file_info.file_type,
+                file_size=file_info.file_size,
+                watermark=file_info.watermark,
+                status="success"
+            ))
+            
+            total_size += file_info.file_size
+            successful_files += 1
+    
+    if not files_to_zip:
+        raise HTTPException(status_code=404, detail="没有找到可下载的文件")
+    
+    # 生成压缩包名称
+    archive_name = request.archive_name
+    if not archive_name:
+        archive_name = generate_archive_filename(task_names, common_lang_out)
+    
+    # 创建ZIP文件
+    try:
+        zip_path, batch_id, archive_size = batch_manager.create_zip_archive(
+            files=files_to_zip,
+            archive_name=archive_name
+        )
+        
+        # 构建下载URL
+        download_url = f"/batch/download/{batch_id}"
+        
+        # 设置过期时间（24小时）
+        expires_at = datetime.now() + timedelta(hours=24)
+        
+        response = BatchDownloadResponse(
+            batch_id=batch_id,
+            total_files=len(request.task_ids),
+            successful_files=successful_files,
+            failed_files=failed_files,
+            total_size=total_size,
+            archive_size=archive_size,
+            files=file_infos,
+            download_url=download_url,
+            expires_at=expires_at
+        )
+        
+        logger.info(f"批量下载准备完成，批次ID: {batch_id}，成功文件: {successful_files}/{len(files_to_zip)}")
+        return response
+        
+    except Exception as e:
+        logger.error(f"创建批量下载文件失败: {e}")
+        raise HTTPException(status_code=500, detail=f"创建下载文件失败: {str(e)}")
+
+
+@app.get("/batch/download/{batch_id}")
+async def download_batch_archive(
+    batch_id: str,
+    api_key: Optional[str] = Depends(validate_api_key)
+):
+    """下载批量打包的ZIP文件"""
+    batch_info = batch_manager.get_batch_info(batch_id)
+    if not batch_info:
+        raise HTTPException(status_code=404, detail="批次不存在或已过期")
+    
+    zip_path = Path(batch_info['zip_path'])
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="下载文件不存在")
+    
+    # 生成下载文件名
+    download_filename = f"babeldoc_batch_{batch_id[:8]}.zip"
+    
+    return FileResponse(
+        path=zip_path,
+        filename=download_filename,
+        media_type='application/zip'
     )
 
 
@@ -552,6 +871,41 @@ async def clear_cache(api_key: Optional[str] = Depends(validate_api_key)):
     except Exception as e:
         logger.error(f"清空缓存失败: {e}")
         raise HTTPException(status_code=500, detail="清空缓存失败")
+
+
+@app.post("/batch/cleanup", response_model=dict)
+async def cleanup_batch_downloads(api_key: Optional[str] = Depends(validate_api_key)):
+    """清理过期的批量下载文件"""
+    try:
+        cleaned_count = batch_manager.cleanup_expired_batches()
+        return {
+            "message": f"已清理 {cleaned_count} 个过期的批量下载文件",
+            "cleaned_count": cleaned_count
+        }
+    except Exception as e:
+        logger.error(f"清理批量下载文件失败: {e}")
+        raise HTTPException(status_code=500, detail="清理失败")
+
+
+@app.get("/batch/stats", response_model=dict)
+async def get_batch_download_stats(api_key: Optional[str] = Depends(validate_api_key)):
+    """获取批量下载统计信息"""
+    try:
+        active_batches = len(batch_manager.batch_cache)
+        total_size = 0
+        
+        for batch_info in batch_manager.batch_cache.values():
+            if Path(batch_info['zip_path']).exists():
+                total_size += batch_info['archive_size']
+        
+        return {
+            "active_batches": active_batches,
+            "total_size_bytes": total_size,
+            "total_size_formatted": format_file_size(total_size)
+        }
+    except Exception as e:
+        logger.error(f"获取批量下载统计失败: {e}")
+        raise HTTPException(status_code=500, detail="获取统计信息失败")
 
 
 # WebSocket 支持（可选）

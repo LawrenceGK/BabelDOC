@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Callable, Any
 import json
 import tempfile
 
-from babeldoc.api.models import TaskStatus, TaskInfo, TranslationRequest
+from babeldoc.api.models import TaskStatus, TaskInfo, TranslationRequest, OutputFileInfo
 from babeldoc.api.cache import get_cache, FileCache
 from babeldoc.format.pdf.translation_config import TranslationConfig, WatermarkOutputMode
 from babeldoc.translator.translator import OpenAITranslator, set_translate_rate_limiter
@@ -102,6 +102,28 @@ class TaskManager:
                     data = json.load(f)
                     for task_data in data.get('tasks', []):
                         try:
+                            # 数据迁移：处理老格式的 output_files
+                            if 'output_files' in task_data and isinstance(task_data['output_files'], list):
+                                # 检查是否是老格式（字符串列表）
+                                if task_data['output_files'] and isinstance(task_data['output_files'][0], str):
+                                    # 转换为新格式
+                                    old_output_files = task_data['output_files']
+                                    task_data['output_file_paths'] = old_output_files.copy()  # 向后兼容
+                                    task_data['output_files'] = []
+                                    
+                                    # 尝试从文件路径推断结构化信息
+                                    for file_path in old_output_files:
+                                        try:
+                                            if Path(file_path).exists():
+                                                file_info = OutputFileInfo.from_file_path(file_path)
+                                                task_data['output_files'].append(file_info.model_dump())
+                                        except Exception as e:
+                                            logger.warning(f"迁移输出文件数据失败 {file_path}: {e}")
+                            
+                            # 确保向后兼容字段存在
+                            if 'output_file_paths' not in task_data:
+                                task_data['output_file_paths'] = []
+                            
                             # 将字典转换为 TaskInfo 对象
                             task_info = TaskInfo(**task_data)
                             
@@ -316,8 +338,27 @@ class TaskManager:
         
         with self.task_locks.get(task_id, threading.RLock()):
             task = self.tasks[task_id]
-            if file_path not in task.output_files:
-                task.output_files.append(file_path)
+            
+            # 创建结构化文件信息
+            try:
+                file_info = OutputFileInfo.from_file_path(file_path)
+                
+                # 检查是否已存在相同文件
+                if not any(existing.file_path == file_path for existing in task.output_files):
+                    task.output_files.append(file_info)
+                    
+                    # 向后兼容：同时更新字符串列表
+                    if file_path not in task.output_file_paths:
+                        task.output_file_paths.append(file_path)
+                    
+                    logger.info(f"添加输出文件: {file_path}, 类型: {file_info.file_type.value}")
+                
+            except Exception as e:
+                logger.error(f"添加输出文件失败 {file_path}: {e}")
+                # 兜底：至少保证字符串列表中有记录
+                if file_path not in task.output_file_paths:
+                    task.output_file_paths.append(file_path)
+            
             task.updated_at = datetime.now()
             
             # 保存任务数据
@@ -654,9 +695,18 @@ class TaskManager:
             
             # 清理输出文件缓存
             task = self.tasks[task_id]
-            for output_file in task.output_files:
+            
+            # 清理结构化文件信息中的文件
+            for file_info in task.output_files:
                 try:
-                    Path(output_file).unlink(missing_ok=True)
+                    Path(file_info.file_path).unlink(missing_ok=True)
+                except Exception as e:
+                    logger.error(f"删除输出文件失败: {e}")
+            
+            # 清理向后兼容的文件路径列表
+            for output_file_path in task.output_file_paths:
+                try:
+                    Path(output_file_path).unlink(missing_ok=True)
                 except Exception as e:
                     logger.error(f"删除输出文件失败: {e}")
             

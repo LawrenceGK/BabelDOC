@@ -3,7 +3,8 @@ API 数据模型
 定义 FastAPI 服务的请求和响应模型
 """
 from enum import Enum
-from typing import Dict, List, Optional, Any
+from pathlib import Path
+from typing import Dict, List, Optional, Any, Annotated
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -22,6 +23,63 @@ class WatermarkMode(str, Enum):
     WATERMARKED = "watermarked"
     NO_WATERMARK = "no_watermark"
     BOTH = "both"
+
+
+class OutputFileType(str, Enum):
+    """输出文件类型"""
+    MONO = "mono"                    # 仅译文版本
+    DUAL = "dual"                    # 双语版本
+    MONO_NO_WATERMARK = "mono_no_watermark"    # 仅译文无水印版本
+    DUAL_NO_WATERMARK = "dual_no_watermark"    # 双语无水印版本
+    GLOSSARY = "glossary"           # 词汇表文件
+
+
+class OutputFileInfo(BaseModel):
+    """输出文件信息"""
+    file_path: str = Field(description="文件路径")
+    file_type: OutputFileType = Field(description="文件类型")
+    file_size: int = Field(description="文件大小（字节）")
+    created_at: datetime = Field(description="创建时间")
+    watermark: bool = Field(description="是否包含水印")
+    
+    @classmethod
+    def from_file_path(cls, file_path: str) -> "OutputFileInfo":
+        """从文件路径推断文件类型"""
+        path = Path(file_path)
+        file_name = path.name.lower()
+        
+        # 根据文件名推断文件类型
+        if file_name.endswith('.glossary.csv'):
+            file_type = OutputFileType.GLOSSARY
+            watermark = False
+        elif '.no_watermark.' in file_name:
+            if '.mono.' in file_name:
+                file_type = OutputFileType.MONO_NO_WATERMARK
+            elif '.dual.' in file_name:
+                file_type = OutputFileType.DUAL_NO_WATERMARK
+            else:
+                file_type = OutputFileType.MONO_NO_WATERMARK  # 默认
+            watermark = False
+        elif '.mono.' in file_name:
+            file_type = OutputFileType.MONO
+            watermark = True
+        elif '.dual.' in file_name:
+            file_type = OutputFileType.DUAL
+            watermark = True
+        else:
+            # 兜底逻辑：默认为仅译文版本
+            file_type = OutputFileType.MONO
+            watermark = True
+        
+        file_size = path.stat().st_size if path.exists() else 0
+        
+        return cls(
+            file_path=str(file_path),
+            file_type=file_type,
+            file_size=file_size,
+            created_at=datetime.now(),
+            watermark=watermark
+        )
 
 
 class TranslationRequest(BaseModel):
@@ -97,7 +155,6 @@ class TranslationRequest(BaseModel):
     # 其他设置
     ignore_cache: bool = Field(default=False, description="忽略翻译缓存")
     working_dir: Optional[str] = Field(default=None, description="工作目录")
-    working_dir: Optional[str] = Field(default=None, description="工作目录")
 
 
 class TranslationResponse(BaseModel):
@@ -121,7 +178,10 @@ class TaskInfo(BaseModel):
     # 文件信息
     input_filename: str = Field(description="输入文件名")
     input_file_size: int = Field(description="输入文件大小（字节）")
-    output_files: List[str] = Field(default=[], description="输出文件列表")
+    output_files: List[OutputFileInfo] = Field(default=[], description="输出文件列表")
+    
+    # 向后兼容：保留原有的字符串列表格式（已弃用，但保留以支持老客户端）
+    output_file_paths: List[str] = Field(default=[], description="输出文件路径列表（已弃用）")
     
     # 翻译设置
     lang_in: str = Field(description="源语言")
@@ -131,6 +191,21 @@ class TaskInfo(BaseModel):
     # 错误信息
     error_message: Optional[str] = Field(default=None, description="错误消息")
     error_traceback: Optional[str] = Field(default=None, description="错误堆栈")
+    
+    def get_file_by_type(self, file_type: OutputFileType) -> Optional[OutputFileInfo]:
+        """根据文件类型获取输出文件"""
+        for file_info in self.output_files:
+            if file_info.file_type == file_type:
+                return file_info
+        return None
+    
+    def get_files_by_type(self, file_type: OutputFileType) -> List[OutputFileInfo]:
+        """根据文件类型获取所有匹配的输出文件"""
+        return [file_info for file_info in self.output_files if file_info.file_type == file_type]
+    
+    def has_file_type(self, file_type: OutputFileType) -> bool:
+        """检查是否存在指定类型的文件"""
+        return any(file_info.file_type == file_type for file_info in self.output_files)
 
 
 class TaskListResponse(BaseModel):
@@ -183,6 +258,7 @@ class ConfigResponse(BaseModel):
     supported_languages: Dict[str, str] = Field(description="支持的语言")
     default_settings: TranslationRequest = Field(description="默认设置")
     limits: Dict[str, Any] = Field(description="限制信息")
+    output_options: Optional[Dict[str, Any]] = Field(default=None, description="输出选项配置")
 
 
 class ProgressUpdate(BaseModel):
@@ -192,3 +268,40 @@ class ProgressUpdate(BaseModel):
     message: str = Field(description="状态消息")
     stage: str = Field(description="当前阶段")
     timestamp: datetime = Field(default_factory=datetime.now, description="时间戳")
+
+
+class BatchDownloadRequest(BaseModel):
+    """批量下载请求模型"""
+    task_ids: Annotated[List[str], Field(description="任务ID列表", min_length=1, max_length=50)]
+    file_types: Optional[List[OutputFileType]] = Field(
+        default=None,
+        description="要下载的文件类型列表。如果为空，默认下载所有可用文件"
+    )
+    include_original: bool = Field(default=False, description="是否包含原文件")
+    watermark: Optional[bool] = Field(default=None, description="是否下载有水印版本。None表示都下载")
+    archive_name: Optional[str] = Field(default=None, description="压缩包名称（不含扩展名）")
+
+
+class BatchDownloadFileInfo(BaseModel):
+    """批量下载文件信息"""
+    task_id: str = Field(description="任务ID")
+    file_name: str = Field(description="文件名")
+    file_type: OutputFileType = Field(description="文件类型")
+    file_size: int = Field(description="文件大小（字节）")
+    watermark: bool = Field(description="是否包含水印")
+    status: str = Field(description="文件状态（success/failed/not_found）")
+    error_message: Optional[str] = Field(default=None, description="错误信息")
+
+
+class BatchDownloadResponse(BaseModel):
+    """批量下载响应模型"""
+    batch_id: str = Field(description="批量下载批次ID")
+    total_files: int = Field(description="总文件数")
+    successful_files: int = Field(description="成功文件数")
+    failed_files: int = Field(description="失败文件数")
+    total_size: int = Field(description="总文件大小（字节）")
+    archive_size: int = Field(description="压缩包大小（字节）")
+    files: List[BatchDownloadFileInfo] = Field(description="文件详细信息")
+    download_url: str = Field(description="下载链接")
+    expires_at: datetime = Field(description="下载链接过期时间")
+    created_at: datetime = Field(default_factory=datetime.now, description="创建时间")
